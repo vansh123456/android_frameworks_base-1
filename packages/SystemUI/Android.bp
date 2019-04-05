@@ -70,6 +70,7 @@ android_library {
         "SystemUI-proto",
         "dagger2-2.19",
         "jsr330",
+        "vendor.lineage.biometrics.fingerprint.inscreen-V1.0-java",
         "tensorflowlite_java"
     ],
     manifest: "AndroidManifest.xml",
@@ -141,6 +142,7 @@ android_library {
         "testables",
         "truth-prebuilt",
         "dagger2-2.19",
+        "vendor.lineage.biometrics.fingerprint.inscreen-V1.0-java",
         "jsr330"
     ],
     libs: [
