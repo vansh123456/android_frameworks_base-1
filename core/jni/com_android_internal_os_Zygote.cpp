@@ -101,6 +101,19 @@
 
 #include "nativebridge/native_bridge.h"
 
+/* Functions in the callchain during the fork shall not be protected with
+   Armv8.3-A Pointer Authentication, otherwise child will not be able to return. */
+#ifdef __ARM_FEATURE_PAC_DEFAULT
+#ifdef __ARM_FEATURE_BTI_DEFAULT
+#define NO_PAC_FUNC __attribute__((target("branch-protection=bti")))
+#else
+#define NO_PAC_FUNC __attribute__((target("branch-protection=none")))
+#endif /* __ARM_FEATURE_BTI_DEFAULT */
+#else /* !__ARM_FEATURE_PAC_DEFAULT */
+#define NO_PAC_FUNC
+#endif /* __ARM_FEATURE_PAC_DEFAULT */
+
+
 namespace {
 
 // TODO (chriswailes): Add a function to initialize native Zygote data.
@@ -1047,6 +1060,101 @@ static void ClearUsapTable() {
   }
 
   gUsapPoolCount = 0;
+}
+
+NO_PAC_FUNC
+static void PAuthKeyChange(JNIEnv* env) {
+#ifdef __aarch64__
+  unsigned long int hwcaps = getauxval(AT_HWCAP);
+  if (hwcaps & HWCAP_PACA) {
+    const unsigned long key_mask = PR_PAC_APIAKEY | PR_PAC_APIBKEY |
+                                   PR_PAC_APDAKEY | PR_PAC_APDBKEY | PR_PAC_APGAKEY;
+    if (prctl(PR_PAC_RESET_KEYS, key_mask, 0, 0, 0) != 0) {
+      ALOGE("Failed to change the PAC keys: %s", strerror(errno));
+      RuntimeAbort(env, __LINE__, "PAC key change failed.");
+    }
+  }
+#endif
+}
+
+// Utility routine to fork a process from the zygote.
+NO_PAC_FUNC
+static pid_t ForkCommon(JNIEnv* env, bool is_system_server,
+                        const std::vector<int>& fds_to_close,
+                        const std::vector<int>& fds_to_ignore,
+                        bool is_priority_fork) {
+  SetSignalHandlers();
+
+  // Curry a failure function.
+  auto fail_fn = std::bind(ZygoteFailure, env, is_system_server ? "system_server" : "zygote",
+                           nullptr, _1);
+
+  // Temporarily block SIGCHLD during forks. The SIGCHLD handler might
+  // log, which would result in the logging FDs we close being reopened.
+  // This would cause failures because the FDs are not whitelisted.
+  //
+  // Note that the zygote process is single threaded at this point.
+  BlockSignal(SIGCHLD, fail_fn);
+
+  // Close any logging related FDs before we start evaluating the list of
+  // file descriptors.
+  __android_log_close();
+  AStatsSocket_close();
+
+  // If this is the first fork for this zygote, create the open FD table.  If
+  // it isn't, we just need to check whether the list of open files has changed
+  // (and it shouldn't in the normal case).
+  if (gOpenFdTable == nullptr) {
+    gOpenFdTable = FileDescriptorTable::Create(fds_to_ignore, fail_fn);
+  } else {
+    gOpenFdTable->Restat(fds_to_ignore, fail_fn);
+  }
+
+  android_fdsan_error_level fdsan_error_level = android_fdsan_get_error_level();
+
+  // Purge unused native memory in an attempt to reduce the amount of false
+  // sharing with the child process.  By reducing the size of the libc_malloc
+  // region shared with the child process we reduce the number of pages that
+  // transition to the private-dirty state when malloc adjusts the meta-data
+  // on each of the pages it is managing after the fork.
+  mallopt(M_PURGE, 0);
+
+  pid_t pid = fork();
+
+  if (pid == 0) {
+    if (is_priority_fork) {
+      setpriority(PRIO_PROCESS, 0, PROCESS_PRIORITY_MAX);
+    } else {
+      setpriority(PRIO_PROCESS, 0, PROCESS_PRIORITY_MIN);
+    }
+
+    // The child process.
+    PAuthKeyChange(env);
+    PreApplicationInit();
+
+    // Clean up any descriptors which must be closed immediately
+    DetachDescriptors(env, fds_to_close, fail_fn);
+
+    // Invalidate the entries in the USAP table.
+    ClearUsapTable();
+
+    // Re-open all remaining open file descriptors so that they aren't shared
+    // with the zygote across a fork.
+    gOpenFdTable->ReopenOrDetach(fail_fn);
+
+    // Turn fdsan back on.
+    android_fdsan_set_error_level(fdsan_error_level);
+
+    // Reset the fd to the unsolicited zygote socket
+    gSystemServerSocketFd = -1;
+  } else {
+    ALOGD("Forked child process %d", pid);
+  }
+
+  // We blocked SIGCHLD prior to a fork, we unblock it here.
+  UnblockSignal(SIGCHLD, fail_fn);
+
+  return pid;
 }
 
 // Create an app data directory over tmpfs overlayed CE / DE storage, and bind mount it
@@ -2034,6 +2142,7 @@ static void com_android_internal_os_Zygote_nativePreApplicationInit(JNIEnv*, jcl
   PreApplicationInit();
 }
 
+NO_PAC_FUNC
 static jint com_android_internal_os_Zygote_nativeForkAndSpecialize(
         JNIEnv* env, jclass, jint uid, jint gid, jintArray gids,
         jint runtime_flags, jobjectArray rlimits,
@@ -2087,6 +2196,7 @@ static jint com_android_internal_os_Zygote_nativeForkAndSpecialize(
     return pid;
 }
 
+NO_PAC_FUNC
 static jint com_android_internal_os_Zygote_nativeForkSystemServer(
         JNIEnv* env, jclass, uid_t uid, gid_t gid, jintArray gids,
         jint runtime_flags, jobjectArray rlimits, jlong permitted_capabilities,
@@ -2159,13 +2269,16 @@ static jint com_android_internal_os_Zygote_nativeForkSystemServer(
  * @param is_priority_fork  Controls the nice level assigned to the newly created process
  * @return child pid in the parent, 0 in the child
  */
-static jint com_android_internal_os_Zygote_nativeForkApp(JNIEnv* env,
-                                                         jclass,
-                                                         jint read_pipe_fd,
-                                                         jint write_pipe_fd,
-                                                         jintArray managed_session_socket_fds,
-                                                         jboolean args_known,
-                                                         jboolean is_priority_fork) {
+NO_PAC_FUNC
+static jint com_android_internal_os_Zygote_nativeForkUsap(JNIEnv* env,
+                                                          jclass,
+                                                          jint read_pipe_fd,
+                                                          jint write_pipe_fd,
+                                                          jintArray managed_session_socket_fds,
+                                                          jboolean is_priority_fork) {
+  std::vector<int> fds_to_close(MakeUsapPipeReadFDVector()),
+                   fds_to_ignore(fds_to_close);
+
   std::vector<int> session_socket_fds =
       ExtractJIntArray(env, "USAP", nullptr, managed_session_socket_fds)
           .value_or(std::vector<int>());
