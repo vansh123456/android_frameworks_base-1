@@ -538,8 +538,8 @@ class ZygoteConnection {
                         parsedArgs.mDisabledCompatChanges,
                         parsedArgs.mRemainingArgs, null /* classLoader */);
             } else {
-                return ZygoteInit.childZygoteInit(parsedArgs.mTargetSdkVersion,
-                        parsedArgs.mRemainingArgs, null /* classLoader */);
+                return ZygoteInit.childZygoteInit(
+                        parsedArgs.mRemainingArgs  /* classLoader */);
             }
         }
     }
