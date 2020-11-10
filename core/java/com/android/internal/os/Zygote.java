@@ -600,10 +600,11 @@ public final class Zygote {
      * @return In the child process, this returns a Runnable that waits for specialization
      *         info to start an app process. In the sygote/parent process this returns null.
      */
-    static Runnable forkUsap(LocalServerSocket usapPoolSocket,
-                             int[] sessionSocketRawFDs,
-                             boolean isPriorityFork) {
-        FileDescriptor[] pipeFDs;
+    static @Nullable Runnable forkUsap(LocalServerSocket usapPoolSocket,
+                                       int[] sessionSocketRawFDs,
+                                       boolean isPriorityFork) {
+        FileDescriptor readFD;
+        FileDescriptor writeFD;
 
         try {
             FileDescriptor[] pipeFDs = Os.pipe2(O_CLOEXEC);
